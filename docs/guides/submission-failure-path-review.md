@@ -50,27 +50,58 @@ git show b8e4072 -- tasks/submission_tasks.py
 
 ### 按检查法核对调用图
 
-在主线提交 `5b8ac14` 上执行：
+在仓库根目录执行下面的搜索。第一条会同时列出公开函数的定义、导入、任务调用、路由调用和测试引用；第二条用退出码区分“没有私有旧入口”和“仍有残留引用”。
 
 ```powershell
-rg -n "^def mark_submission_failed\(" tasks/submission_tasks.py
-rg -n "_mark_submission_failed" tasks routes tests
+rg -n --glob '*.py' "\bmark_submission_failed\b" tasks routes tests
+$privateRefs = rg -n --glob '*.py' "_mark_submission_failed" tasks routes tests 2>$null
+if ($LASTEXITCODE -eq 1) {
+    Write-Output '(no private references)'
+} else {
+    $privateRefs
+}
 ```
 
-判定：第一条只找到一个公开定义；第二条无输出，说明私有转发层没有残留引用。
+在主线提交 `5b8ac14` 上，第一条应至少能解释出一个公开定义、任务内部调用、路由导入和路由调用；第二条应输出 `(no private references)`。这只是调用图的静态证据，仍需要入口测试确认状态写回。
 
 ### 真实入口验证
 
-测试命令：
+先按 README 安装测试依赖，然后在仓库根目录选择本机 Python。命令不依赖某个维护者的用户目录：
 
 ```powershell
-$taskPython = 'C:\Users\1\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
-$taskPyPath = 'C:\Users\1\Desktop\新建文件夹\CodeSense-latest-analysis\.venv-codesense\Lib\site-packages'
-$env:PYTHONPATH = $taskPyPath
-& $taskPython -c "import pytest; raise SystemExit(pytest.main(['-q', 'tests/test_submission_api_queue.py::test_regular_form_marks_submission_failed_when_evaluation_cannot_start']))"
+$python = $null
+$localPython = Join-Path (Get-Location) '.venv\Scripts\python.exe'
+if (Test-Path $localPython) {
+    $python = $localPython
+} elseif (Get-Command python.exe -ErrorAction SilentlyContinue) {
+    $python = (Get-Command python.exe).Source
+} elseif (Get-Command py.exe -ErrorAction SilentlyContinue) {
+    $python = (Get-Command py.exe).Source
+} else {
+    throw '未找到 Python。请先按 README 安装 Python，并完成测试依赖安装。'
+}
+
+& $python -m pytest -q tests/test_submission_api_queue.py::test_regular_form_marks_submission_failed_when_evaluation_cannot_start
 ```
 
-实测结果：`1 passed, 15 warnings in 11.23s`。
+在 Linux/macOS 上使用同样的仓库根目录和测试目标：
+
+```bash
+if [ -x .venv/bin/python ]; then
+    PYTHON=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo '未找到 Python。请先按 README 安装 Python，并完成测试依赖安装。' >&2
+    exit 1
+fi
+
+"$PYTHON" -m pytest -q tests/test_submission_api_queue.py::test_regular_form_marks_submission_failed_when_evaluation_cannot_start
+```
+
+实测结果：`1 passed, 15 warnings in 8.63s`。警告来自依赖弃用提示和测试数据库清理提示，不影响该用例的断言。
 
 这个测试同时检查：
 
@@ -80,6 +111,32 @@ $env:PYTHONPATH = $taskPyPath
 * 提交状态接口也返回 `failed`。
 
 因此，静态搜索验证了调用者只有一条失败状态入口，真实入口测试验证了用户可见的终态没有改变。
+
+## AI 试走记录
+
+为检查这份说明是否能被新手执行，Codex AI 在 `5b8ac14` 对应的仓库根目录按“先搜索、再运行入口测试”的顺序独立执行了一遍。
+
+### 改动前的卡点
+
+旧命令把 Python 解释器和 `PYTHONPATH` 写成另一台工作区的绝对路径。直接按项目常见用法执行 `python --version` 和 `python -m pytest ...` 时，PowerShell 报错：`The term 'python' is not recognized as a name of a cmdlet, function, script file, or executable program.`。这说明新手会在进入测试前停住；它不能证明提交失败路径有问题。
+
+旧的 `rg` 示例只检查公开定义和私有函数名，没有把公开函数的导入与全部调用者列出来。即使命令有输出，也不足以支撑“调用者只有一条失败状态入口”的判断。
+
+### 本次修正
+
+* 测试命令改为优先使用仓库 `.venv`，再查找 PATH 中的 `python.exe` 或 `py.exe`；找不到时给出安装前置条件，而不是暴露某个用户目录。
+* 静态检查改为列出公开函数在 `tasks`、`routes`、`tests` 中的所有引用，并明确报告私有旧入口是否为零。
+* 保留原有的真实入口测试和结果断言，没有改变生产代码、失败提示、数据库状态或路由行为。
+
+### 改动后的复现
+
+在本机临时把已安装的 Python 运行时加入 PATH，并按改后的解释器选择逻辑执行，入口测试结果为 `1 passed, 15 warnings`。随后重新运行调用图搜索：结果包含公开定义、两个任务内部调用、路由导入、路由调用和测试引用；私有入口输出 `(no private references)`。
+
+这段临时 PATH 设置只属于本次验证环境，未写入文档、仓库配置或生产配置。另一台机器仍需先安装 Python 和测试依赖；文档命令会在缺少前置条件时明确停止。
+
+### 前后差异
+
+改动前，执行者需要知道另一台机器的绝对路径，并只能看到不完整的静态引用检查。改动后，执行者可以从仓库根目录按自己的 Python 环境运行，并能同时查看公开入口的定义、导入和调用者，再用入口测试验证失败状态反馈。
 
 ## 事实、推断和边界
 
